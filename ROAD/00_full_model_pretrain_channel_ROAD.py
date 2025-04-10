@@ -24,22 +24,19 @@ from sklearn.model_selection import train_test_split
 import copy
 from captum.attr import IntegratedGradients
 from captum.attr import GradientShap
+from captum.attr import Saliency
 from captum.attr import Occlusion
 from captum.attr import NoiseTunnel
 from captum.attr import FeatureAblation
 from captum.attr import DeepLift
 import pickle
-import gc
-import tracemalloc
-#General ROAR pipeline
-#Train model on train set and get importance estimate of each sample in train set after training(through selected XAI method)
-#Get importance estimate on test set trials as well. Also evaluate performance(Accuracy) on test set.
-#Remove top-k pixels from each trial of train set. Retrain model on modified train set.
-#Remove top-k pixels from each trial of test-set. Evaluate performance on modified test set
+import time
 
+from imputations import NoisyLinearImputer
 # Initialize lovely_tensors and matplotlib
 lt.monkey_patch()
 matplotlib.rc_file("matplotlibrc")
+# All subjects = [1,2,4,7,9,11,13,14,18,22,24,25,26,27,29,31,33,34,35,39,41,42,43,45,46,47,48,51,52,53,55,56,57,59,60,62,63,65,66,67,69,70,71,72,73,74,79,80,86,88,102]
 
 # Configuration YAML
 CFG_YAML = """
@@ -48,22 +45,21 @@ wandb:
 model:
 dataset:
  data_directory: /home/marco/Documents/GitHub/tms_eeg_decoding/data
- file_name: subject_{:03d}_preprocessed_combined_py.fif
+ file_name: subject_{:03d}_preprocessed_combined_pen.fif
  test_subject_indices: 
- subject_index: 10
- #pretrain_subject_indices: [9,11,13,14,18,22,24]
- pretrain_subject_indices: [9,11,13,14,18,22,24]
- #test_subject_indices: [9,11,13,14,18,22,24]
+ subject_index: 100
+ #pretrain_subject_indices: [49, 28]
+ pretrain_subject_indices: [4,7,9,11,14,18,22,31,33,39,51,53,59,63,65,66,70,71,74,76,83,94,95,100,103,104,106,107,108,109,110,111]
 training:
  lr: 0.0003
- num_epochs: 500
+ num_epochs: 1002
  nll_beta: 0.001
  num_warmup_epochs: 20
  batch_size: 50
  random_seed: 42
  precision: bf16
  kde_lambda: 0.5
-exp_name: S4_S4EEGNet_pretrain
+exp_name: channel_ROAR_S4EEGNet_pretrain
 """
 
 def load_config():
@@ -181,21 +177,32 @@ def calculate_calibration_metrics(y_pred, y_target, log_vars, num_bins=10, outli
 def train_one_epoch(epoch, model, train_loader, optimizer, lr_scheduler, accelerator, device, cfg):
     model.train()
     total_loss = 0
-
+    all_preds = []
+    all_logvars = []
+    all_targets_smooth = []
     for data in train_loader:
         optimizer.zero_grad()
         outputs = model(data['epoch'].to(device))
         outputs_mean = outputs[:, 0] 
         log_vars = outputs[:, 1]
-
-        loss = total_loss_fn(outputs_mean, data['label_raw'], log_vars, beta=cfg.training.nll_beta, lambda2=cfg.training.kde_lambda)
+        loss = total_loss_fn(outputs_mean, data['label_raw'].to(device), log_vars, beta=cfg.training.nll_beta, lambda2=cfg.training.kde_lambda)
         accelerator.backward(loss)
         accelerator.clip_grad_norm_(model.parameters(), 2.0)
         optimizer.step()
         lr_scheduler.step()
         total_loss += loss.item()
-
-    return total_loss / len(train_loader)
+        all_preds.append(outputs_mean)
+        all_logvars.append(log_vars)
+        all_targets_smooth.append(data['label_raw'].to(device))
+    all_preds = torch.cat(all_preds)
+    all_logvars = torch.cat(all_logvars)
+    all_targets_smooth = torch.cat(all_targets_smooth)
+    metrics = calculate_regression_metrics(all_preds, all_targets_smooth)
+    calibration_metrics = calculate_calibration_metrics(all_preds, all_targets_smooth, all_logvars)
+    del all_preds, all_logvars, all_targets_smooth
+    #if (epoch + 1) % 20 == 0:
+    #    plot_training_metrics(epoch, all_preds, all_targets_smooth, all_logvars, metrics, calibration_metrics)
+    return total_loss / len(train_loader), metrics, calibration_metrics, None
 
 def plot_training_metrics(epoch, all_preds, all_targets_smooth, all_logvars, metrics, calibration_metrics):
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
@@ -211,7 +218,7 @@ def plot_training_metrics(epoch, all_preds, all_targets_smooth, all_logvars, met
     wandb.log({f"metrics_train": wandb.Image(fig)})
     #plt.show()
 
-# Evaluate the model test set accuracy
+
 def test_set_accuracy(model, data_loader, median, device):
     #Adapt tomorrow to turn raw_label output label into class label with fixed median
     with torch.no_grad():
@@ -234,6 +241,8 @@ def test_set_accuracy(model, data_loader, median, device):
         accuracy = correct_total / len(data_loader.dataset)
         del pred_label_fixed_batch, pred_mean, pred_uncertainty, outputs
         return accuracy
+    
+
 
 def sort_expl_by_importance(explanations):
     """For each feature map in the explanations list, returns the indices
@@ -253,7 +262,8 @@ def sort_expl_by_importance(explanations):
 
     # for each trial, return ordered list of indices of  pixel-wise importances according to explanation method
         return all_indices
-
+    
+    
 def remove_top_k(dataloader, explanations, device, k=100):
     """Change given dataset in-place to replace top-k important indices per trial with 0.
     This assumes the replacement with 0 to the an accurate representation of information removal, which is debatable.
@@ -276,33 +286,30 @@ def remove_top_k(dataloader, explanations, device, k=100):
         
         dataset = dataloader.dataset
         data_shape = dataset[0]["epoch"].shape
-
+        #dataset_test = dataset[0:50]["epoch"]
 
         channels, time_points = data_shape
-        data_iterable_list = dataset.epochs_list[0]
+        #data_iterable_list = dataset.epochs_list
         data_iterable_epochs = dataset.epochs
-        data_iterable_list = torch.from_numpy(data_iterable_list)
-        data_iterable_list.to(device)
+        #data_iterable_list = torch.from_numpy(data_iterable_list)
+        #data_iterable_list.to(device)
         k_start = 0
         k_end = k
     # iterate over lists of top-k pixel importance per trial
         for i, indices in enumerate(sorted_attribution_indices):
+            nlImputer = NoisyLinearImputer()
             #get indices of top-k important pixels of current trial
             indices = sorted(indices[k_start:k_end])
-            #flatten data of current trial
-            flat_data_list = data_iterable_list[i].view(-1)
-            flat_data_epochs = data_iterable_epochs[i].view(-1)
-            # set top-k most importantant pixels to 0
-            flat_data_list[indices] = 0
-            flat_data_epochs[indices] = 0
-            #reshape trail data to orginal data again. change dataset in-place to save on RAM(possibly bad idea to do this, but since we reload entire dataset in each
-            # attempt I assume not a big deal)
-            data_iterable_list[i] = flat_data_list.view(channels, time_points)
-            data_iterable_epochs[i] = flat_data_epochs.view(channels, time_points)
+            # create boolean mask of top-k important pixels
+            mask = np.ones((channels, time_points), dtype=bool)
+            mask[np.unravel_index(indices, (channels, time_points))] = False
+            mask = torch.from_numpy(mask)
+            imputed_sample = nlImputer(data_iterable_epochs[i].unsqueeze(0), mask)
+            data_iterable_epochs[i] = imputed_sample
 
     #Only interesting for test-data. Possibly include boolean option for this
     #performances.append(model_accuracy(model, dataset))
-    
+
 def random_baseline(model, data_loader, device):
     """Randomly shuffle the pixels of the dataset and evaluate the model accuracy.
 
@@ -316,17 +323,23 @@ def random_baseline(model, data_loader, device):
     with torch.no_grad():
         data_shape = dataset[0]["epoch"].shape
         channels, time_points = data_shape
-        data_iterable = dataset.epochs_list[0]
-        for i in range(len(data_iterable)):
-            flat_data = data_iterable[i].reshape(-1)
-            indices = np.random.permutation(flat_data.size)
-            #print(f" indices shape: {indices.shape}")
-        
-            random_explanations.append(flat_data.reshape(channels, time_points))
+        rng = np.random.default_rng(42)
+        #data_iterable = dataset.epochs_list
+        #for j in range(len(data_iterable)):
+        #    for i in range(len(data_iterable[j])):
+        #        # j is subject index, i is trial index
+        #        flat_data = data_iterable[j,i].reshape(-1)
+        #        indices = np.random.permutation(flat_data.size)
+            #print(f" indices shape: {indices.shape}"
+        for data in data_loader:
+            flat_data = data["epoch"].reshape(data["epoch"].shape[0],-1).cpu().numpy()
+
+            #random_explanation = rng.permutation(flat_data,axis=1)
+            random_explanation = rng.uniform(0,100, size=(flat_data.shape[0], flat_data.shape[1]))
+    
+            random_explanations.extend(random_explanation.reshape(data["epoch"].shape[0],channels, time_points))
         return random_explanations
-        
-
-
+    
 def DeepLift_wrapper(model, data_loader, device):
     with torch.no_grad():
         #DeepLift_explanations = np.zeros((len(data_loader.dataset), data_loader.dataset["epoch"].shape[0], data_loader.dataset["epoch"].shape[1]))
@@ -336,9 +349,9 @@ def DeepLift_wrapper(model, data_loader, device):
             x_batch = data["epoch"].to(device)
             dl_attr = dl.attribute(x_batch, target=0)
             DeepLift_explanations.extend(dl_attr.cpu().numpy())
-        return DeepLift_explanations
-
-
+        return np.abs(DeepLift_explanations)
+    
+    
 def IntegratedGradient_wrapper(model, data_loader, device):
     ig = IntegratedGradients(model)
     with torch.no_grad():
@@ -347,20 +360,9 @@ def IntegratedGradient_wrapper(model, data_loader, device):
             x_batch = data["epoch"].to(device)
             ig_attr = ig.attribute(x_batch, target=0)
             IG_explanations.extend(ig_attr.cpu().numpy())
-        return IG_explanations
+        return np.abs(IG_explanations)
+    
 
-"""
-def DeepLiftShap_wrapper(model, data_loader, device):
-    dlshap = DeepLiftShap(model)
-    with torch.no_grad():
-        DLShap_explanations = []
-        for data in data_loader:
-            x_batch = data["epoch"].to(device)
-            dlshap_attr = dlshap.attribute(x_batch, target=0)
-            DLShap_explanations.append(dlshap_attr)
-        return DLShap_explanations
-"""
-        
 def GradientShap_wrapper(model, data_loader, device):
     gs = GradientShap(model)
     with torch.no_grad():
@@ -372,163 +374,142 @@ def GradientShap_wrapper(model, data_loader, device):
             x_batch = data["epoch"].to(device)
             gs_attr = gs.attribute(x_batch, target=0, baselines=naive_baseline)
             GS_explanations.extend(gs_attr.cpu().numpy())
-        return GS_explanations
+        return np.abs(GS_explanations)
 
 
-# start with removing 10% of pixels per input to see if it works
+def Saliency_wrapper(model, data_loader, device):
+    saliency = Saliency(model)
+    with torch.no_grad():
+        Saliency_explanations = []
+        for data in data_loader:
+            x_batch = data["epoch"].to(device)
+            saliency_attr = saliency.attribute(x_batch, target=0)
+            Saliency_explanations.extend(saliency_attr.cpu().numpy())
+        return np.abs(Saliency_explanations)
 
-def main(reps = 5):
-    tracemalloc.start(25)
+    
 
+def main(reps = 1):
     np.random_seed = 42
     torch.manual_seed(42)
 
+    ks = (60*900)*np.arange(0.1, 1.1 ,0.1)
+    ks = ks.astype(int)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = load_config()
     cli_args = parse_args()
     cfg = update_config(cfg, cli_args)
     save_config(cfg, cfg.dataset.subject_index)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    explanation_functions = [random_baseline,DeepLift_wrapper, IntegratedGradient_wrapper, GradientShap_wrapper]
-    explanation_function_names = ["random_baseline", "DeepLift", "IntegratedGradient", "GradientShap"]
-    all_subjects = {}
-    for subject_index in cfg.dataset.pretrain_subject_indices:
-        print(f"\nSubject index: {subject_index}\n")
-        cfg_subject = copy.deepcopy(cfg)
-        cfg_subject.dataset.pretrain_subject_indices = [subject_index]
-        all_explanations = []
-        set_mask_train = np.array([])
-        pretrain_loader, input_shape_train,_,_,_ = get_pretrain_dataloader(cfg_subject, set_mask_train)
-        n_trials = len(pretrain_loader.dataset)
-        del pretrain_loader
 
-        for rep in range(reps):
-            print(f"\nrepetition:  {rep}\n")
-            gc.collect()
-            ks = (60*900)*np.arange(0.1,1,0.1)
-            ks = ks.astype(int)
-            explantions_test_dict = {key : [] for key in explanation_function_names}
-            explantions_test_dict["original"] = []
-            for k in ks:
-                print(f"\nRemoval of {k} pixels per trial\n")
-                gc.collect()
-                for explanation_function, explanation_function_name in zip(explanation_functions, explanation_function_names):
-                    gc.collect()
-                    print(f"Running explanation function: {explanation_function_name}")
-  
-                    #split dataset into train and test set
-                    set_mask_train = np.random.choice([True,False], p=[0.8,0.2], size=n_trials)
-                    set_mask_test = ~set_mask_train
-                    print(f"n_trials: {n_trials}")
-                    runs = ["original", "top-k-removed"]
-                    test_set_accuracies = []
-                    #ensure data is loaded in the same order across runs
+    explanation_functions = [Saliency_wrapper]   
+    explanation_function_names = ["Saliency"]
+
     
+    #explanation_functions = [IntegratedGradient_wrapper, GradientShap_wrapper]
+    #explanation_function_names = ["IntegratedGradient", "GradientShap"]
+
+    pretrain_loader, input_shape_train,_,_,_ = get_pretrain_dataloader(cfg)
+    pretrain_loader = pretrain_loader
+    pretrain_loader_copy = copy.deepcopy(pretrain_loader)
+
+    model = build_model(cfg, input_shape_train, device)
+    optimizer, lr_scheduler = initialize_optimizer_and_scheduler(cfg, model, pretrain_loader_copy)
+    accelerator = accelerate.Accelerator(mixed_precision=cfg.training.precision, log_with="wandb")
+    model, optimizer, lr_scheduler, pretrain_loader = accelerator.prepare(
+            model, optimizer, lr_scheduler, pretrain_loader, 
+            )
+    
+    save_path = os.path.join("exp", cfg.exp_name)
+    os.makedirs(save_path, exist_ok=True)
+    save_interval = 5  # Save checkpoint every 5 epochs
+    with tqdm(range(cfg.training.num_epochs)) as pbar:
+        for epoch in pbar:
+            train_loss,_,_,_= train_one_epoch(epoch, model, pretrain_loader_copy, optimizer, lr_scheduler, accelerator, device, cfg)  
+            pbar.set_description(f"Epoch {epoch} - Train Loss: {train_loss:.2f}")
+
+    for explanation_function, explanation_function_name in zip(explanation_functions, explanation_function_names):
+
+        pretrain_loader_copy = copy.deepcopy(pretrain_loader)
+        explanations_train = []
+        explanations_train.append(explanation_function(model, pretrain_loader_copy, device))
+        for k in ks:
+            time1 = time.time()
+            print(f"\nRunning explanation function {explanation_function_name} with k={k}\n")
+            pretrain_loader_copy = copy.deepcopy(pretrain_loader)
+
+            setup_wandb(cfg, f"{cfg.exp_name}_pretrain", cfg.dataset.subject_index)
+            remove_top_k(pretrain_loader_copy, explanations_train, device, k=k)
+
+            #print(f"removed pix#els of trial 0 in train set: {sum(pretrain_loader_copy.dataset.epochs.data[0].flatten() == 0)}")
+            #print(f"removed pixels of trial 350 in test set: {sum(pretrain_loader_copy.dataset.epochs.data[350].flatten() == 0)}")
+            #print(f"removed pixels of trial 10 in train set: {sum(pretrain_loader_copy.dataset.epochs.data[9].flatten() == 0)}")
+            #print(f"removed pixels of trial 44 in test set: {sum(pretrain_loader_copy.dataset.epochs.data[43].flatten() == 0)}")
+
+            model = build_model(cfg, input_shape_train, device)
+            optimizer, lr_scheduler = initialize_optimizer_and_scheduler(cfg, model, pretrain_loader_copy)
+            accelerator = accelerate.Accelerator(mixed_precision=cfg.training.precision, log_with="wandb")
+            model, optimizer, lr_scheduler, pretrain_loader = accelerator.prepare(
+                    model, optimizer, lr_scheduler, pretrain_loader_copy, 
+            )
+    
+            save_path = os.path.join("exp", cfg.exp_name)
+            os.makedirs(save_path, exist_ok=True)
+            save_interval = 5  # Save checkpoint every 5 epochs
+            with tqdm(range(cfg.training.num_epochs)) as pbar:
+                for epoch in pbar:
+                    train_loss, train_metrics, train_calibration, train_classification = train_one_epoch(epoch, model, pretrain_loader_copy, optimizer, lr_scheduler, accelerator, device, cfg)          
+                    current_lr = optimizer.param_groups[0]['lr']
+            
+                    pbar.set_description(f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Train RMSE: {train_metrics['RMSE']:.4f}")
+            
+                    wandb.log({
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "train_corr": train_metrics["Correlation"],
+                        "train_uce": train_calibration["UCE"],
+                        "learning_rate": current_lr,
+                        'exp_name': explanation_function_name,
+                        'k': k
+                    })
+
+                    if epoch==1000:
+                        save_path = os.path.join("exp", explanation_function_name, str(k))
+                        if not os.path.exists(save_path):
+                            os.makedirs(save_path)
+                        checkpoint_path = os.path.join(save_path, f"ROAD_checkpoint_full_epoch_{epoch}_explanation_func_{explanation_function_name}_k_{k}.pt")
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                            'train_loss': train_loss,
+                            'train_rmse': train_metrics["RMSE"],
+                            'train_corr': train_metrics["Correlation"],
+                            'train_uce': train_calibration["UCE"],
+                            'exp_name': explanation_function_name,
+                            'k': k
+                            }, checkpoint_path)
+            time2 = time.time()
+            print(f"Time taken for k={k}: {(time2-time1):.2f} seconds")
+
+                        # Save TrunkNet checkpoint
+                        #trunk_checkpoint_path = os.path.join(save_path, f"checkpoint_trunk_epoch_{epoch}_explanation_func_{explanation_function_name}_k_{k}.pt")
+                        #torch.save({
+                        #    'epoch': epoch,
+                        #    'trunk_state_dict': model.trunk_net.state_dict(),
+                        #}, trunk_checkpoint_path)
+
+                        # Save HeadNet checkpoint
+                        #head_checkpoint_path = os.path.join(save_path, f"checkpoint_head_epoch_{epoch}_explanation_func_{explanation_function_name}_k_{k}.pt")
+                        #torch.save({
+                        #    'epoch': epoch,
+                        #    'head_state_dict': model.head_net.state_dict(),
+                        #}, head_checkpoint_path)
         
-
-                    explanations_train = []
-                    explanations_test = []
-                    accuracies_test = []
-                    for run in runs:
-                        print(f"\nRUN:  {run}\n")
-                        torch.cuda.empty_cache()
-
-                        pretrain_loader, input_shape_train, epochs_cal, labels_raw_cal, median_cal = get_pretrain_dataloader(cfg_subject, set_mask_train)
-                        # pass calibration values from train loader to test_loader, s.t. both datasets get standardized in the same way
-
-                        # Very inefficient right one. Instead test true model performance one and save train_loader and calibration values
-                        # Then run all XAI methods in extra loop
-
-                        test_loader, input_shape_test,_,_,_ = get_pretrain_dataloader(cfg_subject, set_mask_test, epochs_cal=epochs_cal, labels_raw_cal=labels_raw_cal, median_cal=median_cal)
-
-                        # check carefully that data is loaded in the same order across runs!
-                        if run =="top-k-removed":
-                            remove_top_k(pretrain_loader, explanations_train, device, k=k)
-                            remove_top_k(test_loader , explanations_test, device, k=k)
-            
-                        #print(f"dataset train 0: {pretrain_loader.dataset[0].items()}" )
-                        #print(f"print data shape: {pretrain_loader.dataset[0]["epoch"]}")
-                        #print(f"dataset train 00: {pretrain_loader.dataset[0][0].shape}" )
-
-                        # Setup wandb for pretraining
-                        #setup_wandb(cfg_subject, f"{cfg_subject.exp_name}_pretrain", cfg_subject.dataset.subject_index)
-
-                        model = build_model(cfg_subject, input_shape_train, device)
-
-                        optimizer, lr_scheduler = initialize_optimizer_and_scheduler(cfg_subject, model, pretrain_loader)
-
-                        accelerator = accelerate.Accelerator(mixed_precision=cfg_subject.training.precision, log_with="wandb")
-                        model, optimizer, lr_scheduler, pretrain_loader = accelerator.prepare(
-                        model, optimizer, lr_scheduler, pretrain_loader, 
-                        )
-    
-                        save_path = os.path.join("exp", cfg_subject.exp_name)
-                        os.makedirs(save_path, exist_ok=True)
-                        save_interval = 5  # Save checkpoint every 5 epochs
-                        with tqdm(range(cfg_subject.training.num_epochs)) as pbar:
-                            for epoch in pbar:
-                                train_loss= train_one_epoch(epoch, model, pretrain_loader, optimizer, lr_scheduler, accelerator, device, cfg_subject)  
-
-            
-                                pbar.set_description(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
-    
-    
-
-    	                #   get median through calibration trials? Check other implementation for this
-
-
-                        model.eval()
-                        #turn on if memory leak persits
-                        #del pretrain_loader, optimizer, lr_scheduler, accelerator, epochs_cal, labels_raw_cal, median_cal, 
-
-
-                        #print(f"removed pixels of trial 0 in train set: {sum(pretrain_loader.dataset.epochs.data[0].flatten() == 0)}")
-                        #print(f"removed pixels of trial 350 in test set: {sum(pretrain_loader.dataset.epochs.data[350].flatten() == 0)}")
-                        #print(f"removed pixels of trial 10 in train set: {sum(test_loader.dataset.epochs.data[9].flatten() == 0)}")
-                        #print(f"removed pixels of trial 44 in test set: {sum(test_loader.dataset.epochs.data[43].flatten() == 0)}")
-
-                        #print(f"train set length: {len(pretrain_loader.dataset)}")
-                        #print(f"test set length: {len(test_loader.dataset)}")
-
-
-                        #implement XAI method here and test on
-                        if run == "original":
-                            explanations_train.append(explanation_function(model, pretrain_loader, device))
-                            explanations_test.append(explanation_function(model, test_loader, device))
-                            accuracies_test = test_set_accuracy(model, test_loader, median_cal, device)
-                            explantions_test_dict["original"].append(accuracies_test)
-
-               
-                        elif run =="top-k-removed":
-                            accuracies_test = test_set_accuracy(model, test_loader, median_cal, device)
-                            explantions_test_dict[explanation_function_name].append(accuracies_test)
-                            #XAI method
-
-                        del model, optimizer, lr_scheduler, accelerator, pretrain_loader, test_loader
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        snapshot = tracemalloc.take_snapshot()
-                        top_stats = snapshot.statistics('lineno')
-
-                        stat = top_stats[0]
-                        print("%s memory blocks: %.1f KiB" % (stat.count, stat.size / 1024))
-                        for line in stat.traceback.format():
-                            print(line)
-
-                with open(f'XAI_eval_subject_{subject_index}_rep_{rep}.pickle', 'wb') as handle:
-                    pickle.dump(explantions_test_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-        all_explanations.append(explantions_test_dict)
-        with open(f'XAI_eval_subject_{subject_index}.pickle', 'wb') as handle:
-                pickle.dump(all_explanations, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        all_subjects[str(subject_index)] = all_explanations
-
-    with open("ROAR_all_subjects.pickle", "wb") as handle:
-        pickle.dump(all_subjects, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            wandb.finish()
 
 #%%
 if __name__ == "__main__":
     main()
 # %%
-
-

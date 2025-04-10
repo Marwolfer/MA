@@ -31,7 +31,6 @@ from captum.attr import DeepLift
 import pickle
 import gc
 import tracemalloc
-from imputations import NoisyLinearImputer
 #General ROAR pipeline
 #Train model on train set and get importance estimate of each sample in train set after training(through selected XAI method)
 #Get importance estimate on test set trials as well. Also evaluate performance(Accuracy) on test set.
@@ -57,7 +56,7 @@ dataset:
  #test_subject_indices: [9,11,13,14,18,22,24]
 training:
  lr: 0.0003
- num_epochs: 1
+ num_epochs: 500
  nll_beta: 0.001
  num_warmup_epochs: 20
  batch_size: 50
@@ -272,35 +271,32 @@ def remove_top_k(dataloader, explanations, device, k=100):
     # the original function successively "removes" pixels from the test-set and test accuracy of the model on the deteriorated samples
     # e.g. test accuracy when top-k pixels(top-k according to explanation method) are removed from each sample in the test dataset
     # what we want to do instead is remove only the top k pixel from the dataset before training on the train set
-    # before evaluation we also want to remove the top-k pixels(according to explanation method) of each trial from the test set
+    # before evaluation we also want to remove the top-k pixels(accordin to explanatin method) of each trial from the test set
 
     with torch.no_grad():
         sorted_attribution_indices = sort_expl_by_importance(explanations)
-
-        
         
         dataset = dataloader.dataset
         data_shape = dataset[0]["epoch"].shape
 
-
         channels, time_points = data_shape
-        data_iterable_list = dataset.epochs_list[0]
         data_iterable_epochs = dataset.epochs
-        data_iterable_list = torch.from_numpy(data_iterable_list)
-        data_iterable_list.to(device)
         k_start = 0
         k_end = k
     # iterate over lists of top-k pixel importance per trial
         for i, indices in enumerate(sorted_attribution_indices):
-            nlImputer = NoisyLinearImputer()
             #get indices of top-k important pixels of current trial
             indices = sorted(indices[k_start:k_end])
-            # create boolean mask of top-k important pixels
-            mask = np.zeros((channels, time_points), dtype=bool)
-            mask[np.unravel_index(indices, (channels, time_points))] = True
-            mask = torch.from_numpy(mask)
-            imputed_sample = nlImputer(data_iterable_epochs[i].unsqueeze(0), mask)
-            data_iterable_epochs[i] = imputed_sample
+            #flatten data of current trial
+            
+            flat_data_epochs = data_iterable_epochs[i].view(-1)
+            # set top-k most importantant pixels to 0
+          
+            flat_data_epochs[indices] = 0
+            #reshape trail data to orginal data again. change dataset in-place to save on RAM(possibly bad idea to do this, but since we reload entire dataset in each
+            # attempt I assume not a big deal)
+     
+            data_iterable_epochs[i] = flat_data_epochs.view(channels, time_points)
 
     #Only interesting for test-data. Possibly include boolean option for this
     #performances.append(model_accuracy(model, dataset))
@@ -393,6 +389,7 @@ def main(reps = 5):
     explanation_functions = [random_baseline, DeepLift_wrapper, IntegratedGradient_wrapper, GradientShap_wrapper]
     explanation_function_names = ["random_baseline", "DeepLift", "IntegratedGradient", "GradientShap"]
     all_subjects = {}
+    all_subjects = {str(k): [] for k in cfg.dataset.pretrain_subject_indices}
     for subject_index in cfg.dataset.pretrain_subject_indices:
 
         subject_dict = {}
@@ -431,7 +428,10 @@ def main(reps = 5):
 
 
         accuracies_test = test_set_accuracy(model, test_loader_copy, median_cal, device)
+
+        subject_dict = {k: [] for k in explanation_function_names}
         subject_dict["original"] = accuracies_test
+        
 
         for rep in range(reps):
             print(f"\nrepetition:  {rep}\n")
@@ -482,12 +482,12 @@ def main(reps = 5):
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                with open(f'XAI_eval_subject_{subject_index}_rep_{rep}.pickle', 'wb') as handle:
+                with open(f'ROAR_subject_{subject_index}_rep_{rep}.pickle', 'wb') as handle:
                     pickle.dump(subject_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-        with open(f'XAI_eval_subject_{subject_index}.pickle', 'wb') as handle:
+        with open(f'ROAR_subject_{subject_index}.pickle', 'wb') as handle:
                 pickle.dump(subject_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    all_subjects[str(subject_index)] = subject_dict
+    all_subjects[str(subject_index)].append(subject_dict)
 
     with open("ROAR_all_subjects.pickle", "wb") as handle:
         pickle.dump(all_subjects, handle, protocol=pickle.HIGHEST_PROTOCOL)
