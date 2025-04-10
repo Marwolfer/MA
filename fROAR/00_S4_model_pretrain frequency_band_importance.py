@@ -31,18 +31,17 @@ from captum.attr import DeepLift
 import pickle
 import gc
 import tracemalloc
-#General ROAR pipeline
-#Train model on train set and get importance estimate of each sample in train set after training(through selected XAI method)
-#Get importance estimate on test set trials as well. Also evaluate performance(Accuracy) on test set.
-#Remove top-k pixels from each trial of train set. Retrain model on modified train set.
-#Remove top-k pixels from each trial of test-set. Evaluate performance on modified test set
+
+
+#Maybe cut out some of the indices. right now every subject which is not in the train set is included
+
 
 # Initialize lovely_tensors and matplotlib
 lt.monkey_patch()
 matplotlib.rc_file("matplotlibrc")
 
 # Configuration YAML
-CFG_YAML_bandpass = """
+CFG_YAML_bandpass = """a
 wandb:
  key: f0c92a0059bf12e2647f0a1c22fdcd12555fa6df
 model:
@@ -51,9 +50,9 @@ dataset:
  file_name: subject_{:03d}_bandpass_{}_preprocessed_combined_py.fif
  test_subject_indices: 
  subject_index: 10
- #pretrain_subject_indices: [2,4,7,9,11,13,14,18,22,24]
- pretrain_subject_indices: [2,4,7,9,11,13,14,18,22,24]
- #test_subject_indices: [2,4,7,9,11,13,14,18,22,24]
+ #pretrain_subject_indices: [1,2,13,24,27,29,34,42,43,46,47,52,56,57,60,62,67,69,72,73,80]
+ pretrain_subject_indices: [1,2,13,24,27,29,34,42,43,46,47,52,56,57,60,62,67,69,72,73,80]
+ #test_subject_indices: [1,2,13,24,27,29,34,42,43,46,47,52,56,57,60,62,67,69,72,73,80]
 training:
  lr: 0.0003
  num_epochs: 500
